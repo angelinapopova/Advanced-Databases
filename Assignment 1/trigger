@@ -1,0 +1,50 @@
+CREATE OR REPLACE FUNCTION trg_evaluate_transaction_risk()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_risk_score INT;
+    v_new_status VARCHAR(20);
+    v_reason     TEXT;
+BEGIN
+    v_risk_score := calculate_transaction_risk_score(NEW.transaction_id);
+
+    IF v_risk_score >= 70 THEN
+        v_new_status := 'DECLINED';
+        v_reason := 'Auto-declined: risk score ' || v_risk_score;
+    ELSIF v_risk_score >= 40 THEN
+        v_new_status := 'FLAGGED';
+        v_reason := 'Auto-flagged: risk score ' || v_risk_score;
+    ELSE
+        RETURN NEW;
+    END IF;
+
+
+    UPDATE transactions
+    SET status = v_new_status,
+        risk_score = v_risk_score
+    WHERE transaction_id = NEW.transaction_id;
+
+
+    INSERT INTO fraud_alerts (transaction_id, rule_id, reason, risk_score, alert_status)
+    SELECT
+        NEW.transaction_id,
+        (SELECT rule_id FROM fraud_rules
+         WHERE is_active = TRUE
+           AND threshold_value <= v_risk_score
+         ORDER BY threshold_value DESC
+         LIMIT 1),
+        v_reason,
+        v_risk_score,
+        'OPEN';
+
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_transaction_risk_evaluation ON transactions;
+
+CREATE TRIGGER trg_transaction_risk_evaluation
+    AFTER INSERT ON transactions
+    FOR EACH ROW
+    EXECUTE FUNCTION trg_evaluate_transaction_risk();
