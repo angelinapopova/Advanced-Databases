@@ -1,0 +1,14 @@
+CREATE EXTENSION IF NOT EXISTS pg_cron;
+
+SELECT cron.schedule(
+    'refresh_fraud_dashboard_daily',
+    '0 3 * * *',
+    'CALL refresh_fraud_dashboard()'
+);
+
+
+SELECT cron.schedule(
+    'refresh_fraud_dashboard_realtime',
+    '*/15 9-18 * * 1-5',
+    'REFRESH MATERIALIZED VIEW CONCURRENTLY mv_daily_fraud_summary'
+);
