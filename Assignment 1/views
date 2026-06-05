@@ -1,0 +1,177 @@
+CREATE OR REPLACE VIEW vw_customer_accounts AS
+SELECT
+    c.customer_id,
+    c.first_name || ' ' || c.last_name  AS full_name,
+    c.email,
+    c.country_code,
+    c.is_active                          AS customer_active,
+    a.account_id,
+    a.account_number,
+    a.currency,
+    a.balance,
+    a.status                             AS account_status,
+    a.opened_at,
+    COUNT(cd.card_id)                    AS total_cards,
+    COUNT(cd.card_id) FILTER (WHERE cd.status = 'ACTIVE') AS active_cards
+FROM customers c
+JOIN accounts a   ON a.customer_id = c.customer_id
+LEFT JOIN cards cd ON cd.account_id = a.account_id
+GROUP BY
+    c.customer_id, c.first_name, c.last_name,
+    c.email, c.country_code, c.is_active,
+    a.account_id, a.account_number, a.currency,
+    a.balance, a.status, a.opened_at;
+
+-- Тест:
+SELECT * FROM vw_customer_accounts WHERE customer_id = 1;
+
+
+CREATE OR REPLACE VIEW vw_recent_transactions AS
+SELECT
+    t.transaction_id,
+    c.customer_id,
+    c.first_name || ' ' || c.last_name  AS customer_name,
+    a.account_number,
+    t.amount,
+    t.currency,
+    t.merchant_category,
+    t.merchant_country,
+    t.status,
+    t.risk_score,
+    t.transaction_at,
+    CASE
+        WHEN t.risk_score >= 70 THEN 'CRITICAL'
+        WHEN t.risk_score >= 40 THEN 'HIGH'
+        WHEN t.risk_score >= 20 THEN 'MEDIUM'
+        ELSE 'LOW'
+    END                                  AS risk_level
+FROM transactions t
+JOIN accounts a  ON a.account_id  = t.account_id
+JOIN customers c ON c.customer_id = a.customer_id
+WHERE t.transaction_at >= NOW() - INTERVAL '30 days'
+ORDER BY t.transaction_at DESC;
+
+-- Тест:
+SELECT * FROM vw_recent_transactions LIMIT 20;
+SELECT * FROM vw_recent_transactions WHERE risk_level = 'CRITICAL';
+
+
+CREATE OR REPLACE VIEW vw_flagged_transactions AS
+SELECT
+    t.transaction_id,
+    c.customer_id,
+    c.first_name || ' ' || c.last_name  AS customer_name,
+    c.country_code                       AS customer_country,
+    a.account_number,
+    t.amount,
+    t.currency,
+    t.merchant_category,
+    t.merchant_country,
+    t.status,
+    t.risk_score,
+    t.transaction_at,
+    fa.alert_id,
+    fa.reason                            AS alert_reason,
+    fa.alert_status,
+    fr.rule_name,
+    fr.rule_type,
+    fa.created_at                        AS alert_created_at
+FROM transactions t
+JOIN accounts a     ON a.account_id     = t.account_id
+JOIN customers c    ON c.customer_id    = a.customer_id
+LEFT JOIN fraud_alerts fa ON fa.transaction_id = t.transaction_id
+LEFT JOIN fraud_rules fr  ON fr.rule_id        = fa.rule_id
+WHERE t.status IN ('FLAGGED', 'DECLINED')
+ORDER BY t.risk_score DESC, t.transaction_at DESC;
+
+-- Тест:
+SELECT * FROM vw_flagged_transactions;
+SELECT * FROM vw_flagged_transactions WHERE alert_status = 'OPEN';
+
+
+CREATE OR REPLACE VIEW vw_customer_risk_profile AS
+SELECT
+    c.customer_id,
+    c.first_name || ' ' || c.last_name          AS full_name,
+    c.country_code,
+    c.is_active,
+    COUNT(t.transaction_id)                      AS total_transactions,
+    COUNT(t.transaction_id)
+        FILTER (WHERE t.status = 'APPROVED')     AS approved_count,
+    COUNT(t.transaction_id)
+        FILTER (WHERE t.status = 'FLAGGED')      AS flagged_count,
+    COUNT(t.transaction_id)
+        FILTER (WHERE t.status = 'DECLINED')     AS declined_count,
+    COALESCE(ROUND(AVG(t.risk_score), 2), 0)    AS avg_risk_score,
+    COALESCE(MAX(t.risk_score), 0)               AS max_risk_score,
+    COALESCE(SUM(t.amount)
+        FILTER (WHERE t.status = 'APPROVED'), 0) AS total_approved_amount,
+    COUNT(fa.alert_id)                           AS total_alerts,
+    COUNT(fa.alert_id)
+        FILTER (WHERE fa.alert_status = 'OPEN')  AS open_alerts,
+    CASE
+        WHEN MAX(t.risk_score) >= 80 THEN 'CRITICAL'
+        WHEN MAX(t.risk_score) >= 60 THEN 'HIGH'
+        WHEN MAX(t.risk_score) >= 40 THEN 'MEDIUM'
+        ELSE 'LOW'
+    END                                          AS risk_level
+FROM customers c
+LEFT JOIN accounts a     ON a.customer_id    = c.customer_id
+LEFT JOIN transactions t ON t.account_id     = a.account_id
+LEFT JOIN fraud_alerts fa ON fa.transaction_id = t.transaction_id
+GROUP BY c.customer_id, c.first_name, c.last_name, c.country_code, c.is_active
+ORDER BY max_risk_score DESC, total_alerts DESC;
+
+-- Тест:
+SELECT * FROM vw_customer_risk_profile;
+SELECT * FROM vw_customer_risk_profile WHERE risk_level = 'CRITICAL';
+
+
+CREATE MATERIALIZED VIEW mv_daily_fraud_summary AS
+WITH daily_top_customers AS (
+    SELECT
+        DATE(t.transaction_at)  AS tx_date,
+        a.customer_id,
+        MAX(t.risk_score)       AS max_score,
+        ROW_NUMBER() OVER (
+            PARTITION BY DATE(t.transaction_at)
+            ORDER BY MAX(t.risk_score) DESC
+        )                       AS rnk
+    FROM transactions t
+    JOIN accounts a ON a.account_id = t.account_id
+    GROUP BY DATE(t.transaction_at), a.customer_id
+),
+top3 AS (
+    SELECT
+        tx_date,
+        STRING_AGG(customer_id::TEXT, ', ' ORDER BY rnk) AS top_risky_customers
+    FROM daily_top_customers
+    WHERE rnk <= 3
+    GROUP BY tx_date
+)
+SELECT
+    DATE(t.transaction_at)                           AS transaction_date,
+    COUNT(t.transaction_id)                          AS total_transactions,
+    ROUND(SUM(t.amount), 2)                          AS total_amount,
+    COUNT(t.transaction_id)
+        FILTER (WHERE t.status IN ('FLAGGED', 'DECLINED')) AS flagged_count,
+    ROUND(COALESCE(SUM(t.amount)
+        FILTER (WHERE t.status IN ('FLAGGED', 'DECLINED')), 0), 2) AS suspicious_amount,
+    ROUND(AVG(t.risk_score), 2)                      AS avg_risk_score,
+    top3.top_risky_customers,
+    COUNT(fa.alert_id)                               AS total_fraud_alerts
+FROM transactions t
+LEFT JOIN fraud_alerts fa ON fa.transaction_id = t.transaction_id
+LEFT JOIN top3            ON top3.tx_date = DATE(t.transaction_at)
+GROUP BY DATE(t.transaction_at), top3.top_risky_customers
+ORDER BY transaction_date DESC;
+
+
+
+-- Індекс на дату для швидкого пошуку по конкретному дню
+CREATE UNIQUE INDEX idx_mv_daily_fraud_summary_date
+    ON mv_daily_fraud_summary (transaction_date);
+
+
+
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_daily_fraud_summary;
