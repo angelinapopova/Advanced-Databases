@@ -1,0 +1,233 @@
+CREATE OR REPLACE PROCEDURE create_fraud_alert(
+    p_transaction_id BIGINT,
+    p_reason         TEXT,
+    p_risk_score     INT
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_rule_id        BIGINT;
+    v_existing_alert BIGINT;
+BEGIN
+    -- перевіряємо існування
+    SELECT alert_id INTO v_existing_alert
+    FROM fraud_alerts
+    WHERE transaction_id = p_transaction_id
+    LIMIT 1;
+
+    IF v_existing_alert IS NOT NULL THEN
+        RAISE NOTICE 'Alert already exists for transaction %', p_transaction_id;
+        RETURN;
+    END IF;
+
+    -- Знаходимо найбільш відповідний risk_score
+    SELECT rule_id INTO v_rule_id
+    FROM fraud_rules
+    WHERE is_active = TRUE
+      AND threshold_value <= p_risk_score
+    ORDER BY threshold_value DESC
+    LIMIT 1;
+
+    -- Створюємо алерт
+    INSERT INTO fraud_alerts (transaction_id, rule_id, reason, risk_score, alert_status)
+    VALUES (p_transaction_id, v_rule_id, p_reason, p_risk_score, 'OPEN');
+
+    RAISE NOTICE 'Fraud alert created for transaction % with risk score %', p_transaction_id, p_risk_score;
+END;
+$$;
+
+-- Тест:
+CALL create_fraud_alert(41, 'Manual test alert', 85);
+
+
+
+CREATE OR REPLACE PROCEDURE process_transaction(p_transaction_id BIGINT)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_transaction  transactions%ROWTYPE;
+    v_risk_score   INT;
+    v_old_status   VARCHAR(20);
+    v_new_status   VARCHAR(20);
+    v_reason       TEXT := '';
+BEGIN
+    SELECT * INTO v_transaction
+    FROM transactions
+    WHERE transaction_id = p_transaction_id;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Transaction % not found', p_transaction_id;
+    END IF;
+
+
+    IF v_transaction.status != 'PENDING' THEN
+        RAISE NOTICE 'Transaction % is already processed (status: %)',
+            p_transaction_id, v_transaction.status;
+        RETURN;
+    END IF;
+
+    v_old_status := v_transaction.status;
+
+    v_risk_score := calculate_transaction_risk_score(p_transaction_id);
+
+    IF v_risk_score >= 70 THEN
+        v_new_status := 'DECLINED';
+        v_reason := 'Automatically declined: risk score ' || v_risk_score || ' exceeds maximum threshold';
+    ELSIF v_risk_score >= 40 THEN
+        v_new_status := 'FLAGGED';
+        v_reason := 'Flagged for review: risk score ' || v_risk_score || ' exceeds alert threshold';
+    ELSE
+        v_new_status := 'APPROVED';
+    END IF;
+
+
+    UPDATE transactions
+    SET status     = v_new_status,
+        risk_score = v_risk_score
+    WHERE transaction_id = p_transaction_id;
+
+
+    INSERT INTO transaction_status_history
+        (transaction_id, old_status, new_status, changed_at, changed_by)
+    VALUES
+        (p_transaction_id, v_old_status, v_new_status, NOW(), 'process_transaction');
+
+
+    IF v_new_status = 'APPROVED' THEN
+        UPDATE accounts
+        SET balance = balance - v_transaction.amount
+        WHERE account_id = v_transaction.account_id;
+    END IF;
+
+
+    IF v_new_status IN ('FLAGGED', 'DECLINED') THEN
+        CALL create_fraud_alert(p_transaction_id, v_reason, v_risk_score);
+    END IF;
+
+    RAISE NOTICE 'Transaction % processed: % → % (risk score: %)',
+        p_transaction_id, v_old_status, v_new_status, v_risk_score;
+END;
+$$;
+
+-- Тест (обробляємо PENDING транзакції з seed data):
+CALL process_transaction(41);
+CALL process_transaction(42);
+CALL process_transaction(43);
+CALL process_transaction(44);
+
+
+
+CREATE OR REPLACE PROCEDURE freeze_account(p_account_id BIGINT)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_account      accounts%ROWTYPE;
+    v_customer_id  BIGINT;
+BEGIN
+
+    SELECT * INTO v_account
+    FROM accounts
+    WHERE account_id = p_account_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Account % not found', p_account_id;
+    END IF;
+
+    IF v_account.status = 'FROZEN' THEN
+        RAISE NOTICE 'Account % is already frozen', p_account_id;
+        RETURN;
+    END IF;
+
+    IF v_account.status = 'CLOSED' THEN
+        RAISE EXCEPTION 'Cannot freeze closed account %', p_account_id;
+    END IF;
+
+
+    UPDATE accounts
+    SET status = 'FROZEN'
+    WHERE account_id = p_account_id;
+
+
+    UPDATE cards
+    SET status = 'BLOCKED'
+    WHERE account_id = p_account_id
+      AND status = 'ACTIVE';
+
+
+    SELECT customer_id INTO v_customer_id
+    FROM accounts WHERE account_id = p_account_id;
+
+    INSERT INTO audit_log (customer_id, table_name, operation, old_value, new_value)
+    VALUES (
+        v_customer_id,
+        'accounts',
+        'UPDATE',
+        jsonb_build_object('account_id', p_account_id, 'status', v_account.status),
+        jsonb_build_object('account_id', p_account_id, 'status', 'FROZEN')
+    );
+
+    RAISE NOTICE 'Account % frozen, all active cards blocked', p_account_id;
+END;
+$$;
+
+-- Тест:
+CALL freeze_account(3);
+
+
+
+CREATE OR REPLACE PROCEDURE approve_pending_transactions(
+    p_older_than_minutes INT DEFAULT 10
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_transaction_id  BIGINT;
+    v_processed       INT := 0;
+    v_cutoff_time     TIMESTAMP;
+BEGIN
+    v_cutoff_time := NOW() - (p_older_than_minutes || ' minutes')::INTERVAL;
+
+
+    FOR v_transaction_id IN
+        SELECT transaction_id
+        FROM transactions
+        WHERE status = 'PENDING'
+          AND created_at <= v_cutoff_time
+        ORDER BY created_at ASC
+    LOOP
+        CALL process_transaction(v_transaction_id);
+        v_processed := v_processed + 1;
+    END LOOP;
+
+    RAISE NOTICE 'Processed % pending transactions older than % minutes',
+        v_processed, p_older_than_minutes;
+END;
+$$;
+
+-- Тест:
+CALL approve_pending_transactions();
+CALL approve_pending_transactions(1);
+
+CREATE OR REPLACE PROCEDURE refresh_fraud_dashboard()
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RAISE NOTICE 'Refreshing fraud dashboard at %', NOW();
+
+    REFRESH MATERIALIZED VIEW mv_daily_fraud_summary;
+
+
+    INSERT INTO audit_log (table_name, operation, new_value)
+    VALUES (
+        'mv_daily_fraud_summary',
+        'UPDATE',
+        jsonb_build_object('refreshed_at', NOW())
+    );
+
+    RAISE NOTICE 'Fraud dashboard refreshed successfully';
+END;
+$$;
+
+-- Тест:
+CALL refresh_fraud_dashboard();
