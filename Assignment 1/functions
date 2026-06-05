@@ -1,0 +1,247 @@
+CREATE OR REPLACE FUNCTION get_customer_age(p_customer_id BIGINT)
+RETURNS INT
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_birth_date DATE;
+BEGIN
+    SELECT birth_date INTO v_birth_date
+    FROM customers
+    WHERE customer_id = p_customer_id;
+
+    IF v_birth_date IS NULL THEN
+        RAISE EXCEPTION 'Customer % not found', p_customer_id;
+    END IF;
+
+    RETURN DATE_PART('year', AGE(v_birth_date));
+END;
+$$;
+
+SELECT get_customer_age(1);
+
+
+
+CREATE OR REPLACE FUNCTION mask_card_number(p_card_number TEXT)
+RETURNS TEXT
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF LENGTH(p_card_number) < 16 THEN
+        RAISE EXCEPTION 'Card number too short';
+    END IF;
+
+    IF p_card_number ~ '^\d{16}$' THEN
+        RETURN '**** **** **** ' || RIGHT(p_card_number, 4);
+    END IF;
+
+    RETURN REPEAT('*', LENGTH(p_card_number) - 4) || RIGHT(p_card_number, 4);
+END;
+$$;
+
+-- Тест:
+SELECT mask_card_number('4111111111111001');
+SELECT mask_card_number('a3f1c2d4e5b6a3f1');
+
+
+CREATE OR REPLACE FUNCTION is_high_risk_country(p_country_code CHAR(2))
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_high_risk_countries CHAR(2)[] := ARRAY[
+        'RU',
+        'BY',
+        'KP',
+        'IR',
+        'SY',
+        'MM',
+        'NG',
+        'PK',
+        'VE',
+        'CU',
+        'AF'
+    ];
+BEGIN
+    RETURN p_country_code = ANY(v_high_risk_countries);
+END;
+$$;
+
+-- Тест:
+SELECT is_high_risk_country('RU');
+SELECT is_high_risk_country('UA');
+
+
+CREATE OR REPLACE FUNCTION calculate_customer_daily_volume(
+    p_customer_id BIGINT,
+    p_target_date DATE
+)
+RETURNS NUMERIC(15,2)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_total NUMERIC(15,2);
+BEGIN
+    SELECT COALESCE(SUM(
+        CASE t.currency
+            WHEN 'UAH' THEN t.amount
+            WHEN 'USD' THEN t.amount * 44
+            WHEN 'EUR' THEN t.amount * 51
+        END
+    ), 0)
+    INTO v_total
+    FROM transactions t
+    JOIN accounts a ON a.account_id = t.account_id
+    WHERE a.customer_id = p_customer_id
+      AND t.status = 'APPROVED'
+      AND DATE(t.transaction_at) = p_target_date;
+
+    RETURN v_total;
+END;
+$$;
+
+-- Тест:
+SELECT calculate_customer_daily_volume(1, CURRENT_DATE - 30);
+
+
+
+CREATE OR REPLACE FUNCTION calculate_transaction_risk_score(p_transaction_id BIGINT)
+RETURNS INT
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_transaction     transactions%ROWTYPE;
+    v_customer_id     BIGINT;
+    v_daily_volume    NUMERIC(15,2);
+    v_score           INT := 0;
+    v_hour            INT;
+BEGIN
+    SELECT * INTO v_transaction
+    FROM transactions
+    WHERE transaction_id = p_transaction_id;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Transaction % not found', p_transaction_id;
+    END IF;
+
+
+    SELECT customer_id INTO v_customer_id
+    FROM accounts
+    WHERE account_id = v_transaction.account_id;
+
+    v_hour := DATE_PART('hour', v_transaction.transaction_at);
+
+    -- велика сума (> 50000 UAH або еквівалент)
+    IF (v_transaction.currency = 'UAH' AND v_transaction.amount > 50000) OR
+       (v_transaction.currency = 'USD' AND v_transaction.amount > 1136) OR
+       (v_transaction.currency = 'EUR' AND v_transaction.amount > 980)
+    THEN
+        v_score := v_score + 25;
+    -- Правило 1б: середня сума (> 10000 UAH)
+    ELSIF (v_transaction.currency = 'UAH' AND v_transaction.amount > 10000) OR
+          (v_transaction.currency = 'USD' AND v_transaction.amount > 227) OR
+          (v_transaction.currency = 'EUR' AND v_transaction.amount > 196)
+    THEN
+        v_score := v_score + 10;
+    END IF;
+
+    -- країна з високим ризиком
+    IF is_high_risk_country(v_transaction.merchant_country) THEN
+        v_score := v_score + 30;
+    END IF;
+
+    -- підозрілий merchant category
+    IF v_transaction.merchant_category IN ('GAMBLING', 'CASINO', 'CRYPTO', 'WIRE_TRANSFER') THEN
+        v_score := v_score + 20;
+    END IF;
+
+    -- нічна транзакція (00:00 — 06:00)
+    IF v_hour BETWEEN 0 AND 5 THEN
+        v_score := v_score + 10;
+    END IF;
+
+    -- великий денний об'єм (> 100 000 UAH за день)
+    v_daily_volume := calculate_customer_daily_volume(
+        v_customer_id,
+        DATE(v_transaction.transaction_at)
+    );
+    IF v_daily_volume > 100000 THEN
+        v_score := v_score + 15;
+    END IF;
+
+    RETURN LEAST(v_score, 100);
+END;
+$$;
+
+-- Тест:
+SELECT transaction_id, amount, status, risk_score AS stored_score,
+        calculate_transaction_risk_score(transaction_id) AS calculated_score
+FROM transactions
+ORDER BY calculated_score DESC;
+
+
+
+CREATE OR REPLACE FUNCTION get_customer_risk_profile(p_customer_id BIGINT)
+RETURNS TABLE (
+    customer_name       TEXT,
+    total_transactions  BIGINT,
+    flagged_count       BIGINT,
+    avg_risk_score      NUMERIC(5,2),
+    max_risk_score      INT,
+    open_alerts         BIGINT,
+    risk_level          TEXT
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RETURN QUERY
+    SELECT
+        c.first_name || ' ' || c.last_name                          AS customer_name,
+        COUNT(t.transaction_id)                                      AS total_transactions,
+        COUNT(t.transaction_id) FILTER (WHERE t.status = 'FLAGGED') AS flagged_count,
+        ROUND(AVG(t.risk_score), 2)                                 AS avg_risk_score,
+        MAX(t.risk_score)                                           AS max_risk_score,
+        COUNT(fa.alert_id) FILTER (WHERE fa.alert_status = 'OPEN') AS open_alerts,
+        CASE
+            WHEN MAX(t.risk_score) >= 80 THEN 'CRITICAL'
+            WHEN MAX(t.risk_score) >= 60 THEN 'HIGH'
+            WHEN MAX(t.risk_score) >= 40 THEN 'MEDIUM'
+            ELSE 'LOW'
+        END                                                          AS risk_level
+    FROM customers c
+    LEFT JOIN accounts a  ON a.customer_id = c.customer_id
+    LEFT JOIN transactions t ON t.account_id = a.account_id
+    LEFT JOIN fraud_alerts fa ON fa.transaction_id = t.transaction_id
+    WHERE c.customer_id = p_customer_id
+    GROUP BY c.first_name, c.last_name;
+END;
+$$;
+
+-- Тест:
+SELECT * FROM get_customer_risk_profile(1);
+SELECT * FROM get_customer_risk_profile(3);
+
+
+CREATE OR REPLACE FUNCTION get_account_velocity(
+    p_account_id       BIGINT,
+    p_interval_minutes INT DEFAULT 60
+)
+RETURNS INT
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_count INT;
+BEGIN
+    SELECT COUNT(*) INTO v_count
+    FROM transactions
+    WHERE account_id = p_account_id
+      AND transaction_at >= NOW() - (p_interval_minutes || ' minutes')::INTERVAL;
+
+    RETURN v_count;
+END;
+$$;
+
+-- Тест:
+SELECT get_account_velocity(4, 60);   -- транзакцій за останню годину
+SELECT get_account_velocity(4, 1440); -- транзакцій за останній день
+
+
