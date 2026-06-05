@@ -1,0 +1,333 @@
+CREATE DATABASE Banking_Fraud_Monitoring_System;
+
+CREATE EXTENSION IF NOT EXISTS pgcrypto; -- for hashing
+
+CREATE TABLE customers (
+    customer_id   BIGSERIAL    PRIMARY KEY,
+    first_name    VARCHAR(100) NOT NULL,
+    last_name     VARCHAR(100) NOT NULL,
+    email         VARCHAR(255) NOT NULL,
+    birth_date    DATE         NOT NULL,
+    country_code  CHAR(2)      NOT NULL,
+    created_at    TIMESTAMP    NOT NULL DEFAULT NOW(),
+    is_active     BOOLEAN      NOT NULL DEFAULT TRUE,
+
+    CONSTRAINT uq_customers_email CHECK (email ~* '^[^@]+@[^@]+\.[^@]+$'),
+    CONSTRAINT uq_customers_email_unique UNIQUE (email)
+);
+
+
+CREATE TABLE accounts (
+    account_id     BIGSERIAL      PRIMARY KEY,
+    customer_id    BIGINT         NOT NULL REFERENCES customers(customer_id),
+    account_number VARCHAR(20)    NOT NULL UNIQUE,
+    currency       CHAR(3)        NOT NULL,
+    balance        NUMERIC(15,2)  NOT NULL DEFAULT 0,
+    status         VARCHAR(20)    NOT NULL DEFAULT 'ACTIVE',
+    opened_at      TIMESTAMP      NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT chk_accounts_currency CHECK (currency IN ('UAH', 'USD', 'EUR')),
+    CONSTRAINT chk_accounts_balance  CHECK (balance >= 0),
+    CONSTRAINT chk_accounts_status   CHECK (status IN ('ACTIVE', 'FROZEN', 'CLOSED'))
+);
+
+
+CREATE TABLE cards (
+    card_id           BIGSERIAL    PRIMARY KEY,
+    account_id        BIGINT       NOT NULL REFERENCES accounts(account_id),
+    card_number_hash  VARCHAR(64)  NOT NULL UNIQUE,   -- SHA-256 of real PAN
+    card_type         VARCHAR(20)  NOT NULL,
+    status            VARCHAR(20)  NOT NULL DEFAULT 'ACTIVE',
+    expiration_date   DATE         NOT NULL,
+
+    CONSTRAINT chk_cards_type   CHECK (card_type IN ('DEBIT', 'CREDIT')),
+    CONSTRAINT chk_cards_status CHECK (status IN ('ACTIVE', 'BLOCKED', 'EXPIRED'))
+);
+
+
+CREATE TABLE fraud_rules (
+    rule_id         BIGSERIAL    PRIMARY KEY,
+    rule_name       VARCHAR(100) NOT NULL,
+    rule_type       VARCHAR(50)  NOT NULL,
+    threshold_value INT          NOT NULL,
+    is_active       BOOLEAN      NOT NULL DEFAULT TRUE,
+
+    CONSTRAINT chk_fraud_rules_threshold CHECK (threshold_value > 0)
+);
+
+
+CREATE TABLE transactions (
+    transaction_id    BIGSERIAL      PRIMARY KEY,
+    account_id        BIGINT         NOT NULL REFERENCES accounts(account_id),
+    card_id           BIGINT         REFERENCES cards(card_id),
+    amount            NUMERIC(15,2)  NOT NULL,
+    currency          CHAR(3)        NOT NULL,
+    merchant_category VARCHAR(100),
+    merchant_country  CHAR(2),
+    status            VARCHAR(20)    NOT NULL DEFAULT 'PENDING',
+    risk_score        INT            NOT NULL DEFAULT 0,
+    transaction_at    TIMESTAMP      NOT NULL DEFAULT NOW(),
+    created_at        TIMESTAMP      NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT chk_transactions_amount   CHECK (amount > 0),
+    CONSTRAINT chk_transactions_currency CHECK (currency IN ('UAH', 'USD', 'EUR')),
+    CONSTRAINT chk_transactions_status   CHECK (status IN ('PENDING', 'APPROVED', 'DECLINED', 'FLAGGED')),
+    CONSTRAINT chk_transactions_risk     CHECK (risk_score BETWEEN 0 AND 100)
+);
+
+
+CREATE TABLE transaction_status_history (
+    history_id     BIGSERIAL    PRIMARY KEY,
+    transaction_id BIGINT       NOT NULL REFERENCES transactions(transaction_id),
+    old_status     VARCHAR(20),
+    new_status     VARCHAR(20)  NOT NULL,
+    changed_at     TIMESTAMP    NOT NULL DEFAULT NOW(),
+    changed_by     VARCHAR(100) NOT NULL DEFAULT 'system'
+);
+
+
+CREATE TABLE fraud_alerts (
+    alert_id       BIGSERIAL    PRIMARY KEY,
+    transaction_id BIGINT       NOT NULL REFERENCES transactions(transaction_id),
+    rule_id        BIGINT       REFERENCES fraud_rules(rule_id),
+    reason         TEXT         NOT NULL,
+    risk_score     INT          NOT NULL,
+    alert_status   VARCHAR(20)  NOT NULL DEFAULT 'OPEN',
+    created_at     TIMESTAMP    NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT chk_fraud_alerts_risk    CHECK (risk_score BETWEEN 0 AND 100),
+    CONSTRAINT chk_fraud_alerts_status  CHECK (alert_status IN ('OPEN', 'REVIEWED', 'CLOSED', 'FALSE_POSITIVE'))
+);
+
+
+CREATE TABLE audit_log (
+    audit_id    BIGSERIAL    PRIMARY KEY,
+    customer_id BIGINT       REFERENCES customers(customer_id),
+    table_name  VARCHAR(100) NOT NULL,
+    operation   VARCHAR(10)  NOT NULL,
+    old_value   JSONB,
+    new_value   JSONB,
+    changed_at  TIMESTAMP    NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT chk_audit_log_operation CHECK (operation IN ('INSERT', 'UPDATE', 'DELETE'))
+);
+
+
+-- INDEXES
+
+CREATE INDEX idx_accounts_customer_id    ON accounts(customer_id);
+CREATE INDEX idx_cards_account_id        ON cards(account_id);
+CREATE INDEX idx_transactions_account_id ON transactions(account_id);
+CREATE INDEX idx_transactions_card_id    ON transactions(card_id);
+CREATE INDEX idx_transactions_status     ON transactions(status);
+CREATE INDEX idx_transactions_at         ON transactions(transaction_at);
+CREATE INDEX idx_fraud_alerts_tx_id      ON fraud_alerts(transaction_id);
+CREATE INDEX idx_audit_log_table         ON audit_log(table_name);
+CREATE INDEX idx_tsh_transaction_id      ON transaction_status_history(transaction_id);
+
+
+-- SEED DATA
+
+INSERT INTO customers (first_name, last_name, email, birth_date, country_code, created_at, is_active) VALUES
+('Олексій',  'Коваленко',  'oleksiy.kovalenko@gmail.com',   '1985-03-12', 'UA', NOW() - INTERVAL '3 years',  TRUE),
+('Марія',    'Шевченко',   'maria.shevchenko@ukr.net',      '1992-07-24', 'UA', NOW() - INTERVAL '2 years',  TRUE),
+('Іван',     'Петренко',   'ivan.petrenko@gmail.com',       '1978-11-05', 'UA', NOW() - INTERVAL '4 years',  TRUE),
+('Анна',     'Бондаренко', 'anna.bondarenko@yahoo.com',     '1995-01-30', 'UA', NOW() - INTERVAL '1 year',   TRUE),
+('Дмитро',   'Мельник',    'dmytro.melnyk@gmail.com',       '1988-09-18', 'UA', NOW() - INTERVAL '5 years',  TRUE),
+('John',     'Smith',      'john.smith@gmail.com',          '1980-04-22', 'US', NOW() - INTERVAL '2 years',  TRUE),
+('Elena',    'Müller',     'elena.mueller@gmail.com',       '1990-06-15', 'DE', NOW() - INTERVAL '1 year',   TRUE),
+('Tomas',    'Novak',      'tomas.novak@seznam.cz',         '1975-12-08', 'CZ', NOW() - INTERVAL '3 years',  TRUE),
+('Oksana',   'Hrytsenko',  'oksana.hrytsenko@ukr.net',      '2000-02-14', 'UA', NOW() - INTERVAL '6 months', TRUE),
+('Serhii',   'Lysenko',    'serhii.lysenko@proton.me',      '1983-08-27', 'UA', NOW() - INTERVAL '2 years',  FALSE);
+
+
+INSERT INTO accounts (customer_id, account_number, currency, balance, status, opened_at) VALUES
+-- Олексій: UAH + USD
+(1,  'UA001000000000001', 'UAH', 125000.00, 'ACTIVE',  NOW() - INTERVAL '3 years'),
+(1,  'UA001000000000002', 'USD',   3200.00, 'ACTIVE',  NOW() - INTERVAL '2 years'),
+-- Марія: UAH
+(2,  'UA002000000000003', 'UAH',  45000.00, 'ACTIVE',  NOW() - INTERVAL '2 years'),
+-- Іван: UAH + EUR
+(3,  'UA003000000000004', 'UAH', 230000.00, 'ACTIVE',  NOW() - INTERVAL '4 years'),
+(3,  'UA003000000000005', 'EUR',   8500.00, 'ACTIVE',  NOW() - INTERVAL '3 years'),
+-- Анна: UAH
+(4,  'UA004000000000006', 'UAH',  18000.00, 'ACTIVE',  NOW() - INTERVAL '1 year'),
+-- Дмитро: UAH (frozen — suspicious)
+(5,  'UA005000000000007', 'UAH',  67000.00, 'FROZEN',  NOW() - INTERVAL '5 years'),
+-- John: USD
+(6,  'US006000000000008', 'USD',  15000.00, 'ACTIVE',  NOW() - INTERVAL '2 years'),
+-- Elena: EUR
+(7,  'DE007000000000009', 'EUR',  22000.00, 'ACTIVE',  NOW() - INTERVAL '1 year'),
+-- Tomas: EUR
+(8,  'CZ008000000000010', 'EUR',   5500.00, 'ACTIVE',  NOW() - INTERVAL '3 years'),
+-- Oksana: UAH
+(9,  'UA009000000000011', 'UAH',   9000.00, 'ACTIVE',  NOW() - INTERVAL '6 months'),
+-- Serhii: UAH (closed — inactive customer)
+(10, 'UA010000000000012', 'UAH',      0.00, 'CLOSED',  NOW() - INTERVAL '2 years'),
+-- Extra accounts for richer transaction data
+(2,  'UA002000000000013', 'USD',   1200.00, 'ACTIVE',  NOW() - INTERVAL '1 year'),
+(4,  'UA004000000000014', 'EUR',    300.00, 'ACTIVE',  NOW() - INTERVAL '8 months');
+
+
+INSERT INTO cards (account_id, card_number_hash, card_type, status, expiration_date) VALUES
+(1,  encode(digest('4111111111111001', 'sha256'), 'hex'), 'DEBIT',  'ACTIVE',   '2027-12-31'),
+(2,  encode(digest('4111111111111002', 'sha256'), 'hex'), 'CREDIT', 'ACTIVE',   '2026-06-30'),
+(3,  encode(digest('4111111111111003', 'sha256'), 'hex'), 'DEBIT',  'ACTIVE',   '2028-03-31'),
+(4,  encode(digest('4111111111111004', 'sha256'), 'hex'), 'DEBIT',  'ACTIVE',   '2026-09-30'),
+(5,  encode(digest('4111111111111005', 'sha256'), 'hex'), 'CREDIT', 'ACTIVE',   '2027-01-31'),
+(6,  encode(digest('4111111111111006', 'sha256'), 'hex'), 'DEBIT',  'ACTIVE',   '2025-12-31'),
+(7,  encode(digest('4111111111111007', 'sha256'), 'hex'), 'DEBIT',  'BLOCKED',  '2026-11-30'),
+(8,  encode(digest('4111111111111008', 'sha256'), 'hex'), 'CREDIT', 'ACTIVE',   '2027-08-31'),
+(9,  encode(digest('4111111111111009', 'sha256'), 'hex'), 'DEBIT',  'ACTIVE',   '2028-02-28'),
+(10, encode(digest('4111111111111010', 'sha256'), 'hex'), 'CREDIT', 'ACTIVE',   '2027-05-31'),
+(11, encode(digest('4111111111111011', 'sha256'), 'hex'), 'DEBIT',  'ACTIVE',   '2026-07-31'),
+(13, encode(digest('4111111111111013', 'sha256'), 'hex'), 'CREDIT', 'ACTIVE',   '2027-10-31'),
+(14, encode(digest('4111111111111014', 'sha256'), 'hex'), 'DEBIT',  'ACTIVE',   '2026-04-30');
+
+
+INSERT INTO fraud_rules (rule_name, rule_type, threshold_value, is_active) VALUES
+('Large Single Transaction',     'AMOUNT_THRESHOLD',    50000,  TRUE),
+('High Daily Volume',            'DAILY_VOLUME',        100000, TRUE),
+('High Risk Country',            'GEO_RISK',            70,     TRUE),
+('Multiple Transactions 1h',     'VELOCITY',            5,      TRUE),
+('Night Transaction > 10000',    'TIME_RISK',           10000,  TRUE),
+('Cross-Currency Large Amount',  'CURRENCY_MISMATCH',   20000,  TRUE),
+('Card Not Present > 5000',      'CNP_RISK',            5000,   TRUE),
+('Gambling Merchant',            'MERCHANT_CATEGORY',   1,      TRUE);
+
+
+-- Normal everyday transactions
+INSERT INTO transactions (account_id, card_id, amount, currency, merchant_category, merchant_country, status, risk_score, transaction_at) VALUES
+(1,  1,   350.00,  'UAH', 'GROCERY',      'UA', 'APPROVED', 5,  NOW() - INTERVAL '30 days'),
+(1,  1,  1200.00,  'UAH', 'RESTAURANT',   'UA', 'APPROVED', 8,  NOW() - INTERVAL '29 days'),
+(3,  3,   890.00,  'UAH', 'PHARMACY',     'UA', 'APPROVED', 4,  NOW() - INTERVAL '28 days'),
+(6,  6,    75.00,  'UAH', 'GROCERY',      'UA', 'APPROVED', 3,  NOW() - INTERVAL '28 days'),
+(4,  4,  4500.00,  'UAH', 'ELECTRONICS',  'UA', 'APPROVED', 12, NOW() - INTERVAL '27 days'),
+(9,  9,   200.00,  'UAH', 'GROCERY',      'UA', 'APPROVED', 2,  NOW() - INTERVAL '27 days'),
+(11, 11,  550.00,  'UAH', 'CLOTHING',     'UA', 'APPROVED', 6,  NOW() - INTERVAL '26 days'),
+(8,  8,   320.00,  'USD', 'RESTAURANT',   'US', 'APPROVED', 5,  NOW() - INTERVAL '26 days'),
+(10, 10, 1800.00,  'EUR', 'HOTEL',        'DE', 'APPROVED', 9,  NOW() - INTERVAL '25 days'),
+(5,  5,  3200.00,  'EUR', 'AIRLINE',      'FR', 'APPROVED', 14, NOW() - INTERVAL '25 days'),
+(1,  2,   450.00,  'USD', 'ONLINE_STORE', 'US', 'APPROVED', 10, NOW() - INTERVAL '24 days'),
+(3,  3,  2800.00,  'UAH', 'FUEL',         'UA', 'APPROVED', 6,  NOW() - INTERVAL '24 days'),
+(6,  6,  1100.00,  'UAH', 'UTILITY',      'UA', 'APPROVED', 4,  NOW() - INTERVAL '23 days'),
+(9,  9,   175.00,  'UAH', 'GROCERY',      'UA', 'APPROVED', 3,  NOW() - INTERVAL '23 days'),
+(11, 11, 3400.00,  'UAH', 'MEDICAL',      'UA', 'APPROVED', 7,  NOW() - INTERVAL '22 days'),
+(4,  4,   620.00,  'UAH', 'GROCERY',      'UA', 'APPROVED', 4,  NOW() - INTERVAL '22 days'),
+(8,  8,  1250.00,  'USD', 'ONLINE_STORE', 'US', 'APPROVED', 11, NOW() - INTERVAL '21 days'),
+(10, 10, 4200.00,  'EUR', 'CLOTHING',     'DE', 'APPROVED', 8,  NOW() - INTERVAL '21 days'),
+(13, 12, 9800.00,  'USD', 'ELECTRONICS',  'US', 'APPROVED', 18, NOW() - INTERVAL '20 days'),
+(14, 13,  380.00,  'EUR', 'GROCERY',      'PL', 'APPROVED', 6,  NOW() - INTERVAL '20 days'),
+-- Moderately suspicious (elevated risk)
+(1,  1,  15000.00, 'UAH', 'JEWELRY',      'UA', 'APPROVED', 35, NOW() - INTERVAL '15 days'),
+(4,  4,  12000.00, 'UAH', 'ONLINE_STORE', 'CN', 'FLAGGED',  55, NOW() - INTERVAL '15 days'),
+(8,  8,   4800.00, 'USD', 'GAMBLING',     'MT', 'FLAGGED',  62, NOW() - INTERVAL '14 days'),
+(3,  3,   8500.00, 'UAH', 'CASINO',       'UA', 'FLAGGED',  58, NOW() - INTERVAL '14 days'),
+(11, 11,  6200.00, 'UAH', 'ONLINE_STORE', 'NG', 'FLAGGED',  65, NOW() - INTERVAL '13 days'),
+(1,  2,   7500.00, 'USD', 'CRYPTO',       'RU', 'FLAGGED',  72, NOW() - INTERVAL '13 days'),
+(10, 10,  9900.00, 'EUR', 'CASINO',       'CY', 'FLAGGED',  68, NOW() - INTERVAL '12 days'),
+(5,  5,  18000.00, 'EUR', 'JEWELRY',      'AE', 'FLAGGED',  70, NOW() - INTERVAL '12 days'),
+-- Night-time transactions (high risk by time)
+(6,  6,  11000.00, 'UAH', 'ELECTRONICS',  'UA', 'FLAGGED',  60, NOW() - INTERVAL '10 days' + INTERVAL '2 hours'),
+(9,  9,  13500.00, 'UAH', 'ONLINE_STORE', 'US', 'FLAGGED',  63, NOW() - INTERVAL '10 days' + INTERVAL '3 hours'),
+-- Very large transactions (fraud-level)
+(3,  3,  75000.00, 'UAH', 'WIRE_TRANSFER','RU', 'FLAGGED',  88, NOW() - INTERVAL '7 days'),
+(1,  1,  60000.00, 'UAH', 'CRYPTO',       'KP', 'FLAGGED',  95, NOW() - INTERVAL '6 days'),
+(8,  8,  45000.00, 'USD', 'WIRE_TRANSFER','IR', 'FLAGGED',  92, NOW() - INTERVAL '6 days'),
+(5,  5,  55000.00, 'EUR', 'CASINO',       'CY', 'FLAGGED',  90, NOW() - INTERVAL '5 days'),
+-- Velocity attack: many small transactions in short window
+(4,  4,    150.00, 'UAH', 'ONLINE_STORE', 'UA', 'APPROVED', 20, NOW() - INTERVAL '3 days'),
+(4,  4,    210.00, 'UAH', 'ONLINE_STORE', 'PL', 'APPROVED', 22, NOW() - INTERVAL '3 days' + INTERVAL '5 minutes'),
+(4,  4,    180.00, 'UAH', 'ONLINE_STORE', 'DE', 'APPROVED', 24, NOW() - INTERVAL '3 days' + INTERVAL '12 minutes'),
+(4,  4,    190.00, 'UAH', 'ONLINE_STORE', 'CN', 'FLAGGED',  45, NOW() - INTERVAL '3 days' + INTERVAL '20 minutes'),
+(4,  4,    220.00, 'UAH', 'ONLINE_STORE', 'US', 'FLAGGED',  48, NOW() - INTERVAL '3 days' + INTERVAL '28 minutes'),
+(4,  4,    200.00, 'UAH', 'ONLINE_STORE', 'UA', 'FLAGGED',  50, NOW() - INTERVAL '3 days' + INTERVAL '35 minutes'),
+-- Recent pending transactions
+(1,  1,   1800.00, 'UAH', 'GROCERY',      'UA', 'PENDING',  5,  NOW() - INTERVAL '2 hours'),
+(3,  3,   4200.00, 'UAH', 'ELECTRONICS',  'UA', 'PENDING',  10, NOW() - INTERVAL '1 hour'),
+(9,  9,    350.00, 'UAH', 'RESTAURANT',   'UA', 'PENDING',  3,  NOW() - INTERVAL '30 minutes'),
+(8,  8,   2200.00, 'USD', 'AIRLINE',      'US', 'PENDING',  8,  NOW() - INTERVAL '20 minutes'),
+-- Declined transactions
+(6,  6,   5500.00, 'UAH', 'GAMBLING',     'MT', 'DECLINED', 75, NOW() - INTERVAL '8 days'),
+(11, 11, 80000.00, 'UAH', 'WIRE_TRANSFER','IR', 'DECLINED', 99, NOW() - INTERVAL '4 days'),
+(14, 13,  1200.00, 'EUR', 'ONLINE_STORE', 'NG', 'DECLINED', 70, NOW() - INTERVAL '2 days'),
+-- Cross-currency suspicious
+(1,  2,  22000.00, 'USD', 'WIRE_TRANSFER','AE', 'FLAGGED',  80, NOW() - INTERVAL '1 day'),
+(5,  5,  30000.00, 'EUR', 'CRYPTO',       'RU', 'FLAGGED',  93, NOW() - INTERVAL '12 hours'),
+(3,  3,   9500.00, 'UAH', 'CASINO',       'MT', 'FLAGGED',  66, NOW() - INTERVAL '6 hours');
+
+
+-- All transactions start as PENDING → then move to their current status
+INSERT INTO transaction_status_history (transaction_id, old_status, new_status, changed_at, changed_by)
+SELECT
+    t.transaction_id,
+    NULL,
+    'PENDING',
+    t.transaction_at,
+    'system'
+FROM transactions t;
+
+INSERT INTO transaction_status_history (transaction_id, old_status, new_status, changed_at, changed_by)
+SELECT
+    t.transaction_id,
+    'PENDING',
+    t.status,
+    t.transaction_at + INTERVAL '1 minute',
+    CASE
+        WHEN t.status = 'APPROVED'  THEN 'auto_approve'
+        WHEN t.status = 'DECLINED'  THEN 'fraud_engine'
+        WHEN t.status = 'FLAGGED'   THEN 'fraud_engine'
+        ELSE 'system'
+    END
+FROM transactions t
+WHERE t.status != 'PENDING';
+
+
+INSERT INTO fraud_alerts (transaction_id, rule_id, reason, risk_score, alert_status, created_at)
+SELECT
+    t.transaction_id,
+    CASE
+        WHEN t.amount >= 50000                                 THEN 1  -- Large Single Transaction
+        WHEN t.merchant_category IN ('GAMBLING','CASINO')      THEN 8  -- Gambling Merchant
+        WHEN t.merchant_country IN ('RU','KP','IR','NG')       THEN 3  -- High Risk Country
+        WHEN t.merchant_category IN ('CRYPTO','WIRE_TRANSFER') THEN 6  -- Cross-Currency
+        ELSE 4                                                          -- Multiple Transactions
+    END AS rule_id,
+    CASE
+        WHEN t.amount >= 50000                                 THEN 'Transaction amount exceeds large transaction threshold'
+        WHEN t.merchant_category IN ('GAMBLING','CASINO')      THEN 'Gambling or casino merchant detected'
+        WHEN t.merchant_country IN ('RU','KP','IR','NG')       THEN 'Transaction to high-risk country'
+        WHEN t.merchant_category IN ('CRYPTO','WIRE_TRANSFER') THEN 'Crypto or wire transfer to suspicious destination'
+        ELSE 'High transaction velocity detected in short time window'
+    END AS reason,
+    t.risk_score,
+    CASE
+        WHEN t.risk_score >= 90 THEN 'CLOSED'       -- already acted on
+        WHEN t.risk_score >= 70 THEN 'REVIEWED'
+        ELSE 'OPEN'
+    END AS alert_status,
+    t.transaction_at + INTERVAL '2 minutes'
+FROM transactions t
+WHERE t.status IN ('FLAGGED', 'DECLINED');
+
+
+INSERT INTO audit_log (customer_id, table_name, operation, old_value, new_value, changed_at) VALUES
+(5,  'accounts',     'UPDATE', '{"status":"ACTIVE"}',  '{"status":"FROZEN"}',                    NOW() - INTERVAL '5 days'),
+(10, 'customers',    'UPDATE', '{"is_active":true}',   '{"is_active":false}',                    NOW() - INTERVAL '2 years'),
+(3,  'transactions', 'UPDATE', '{"status":"PENDING"}', '{"status":"FLAGGED","risk_score":88}',   NOW() - INTERVAL '7 days'),
+(1,  'transactions', 'UPDATE', '{"status":"PENDING"}', '{"status":"FLAGGED","risk_score":95}',   NOW() - INTERVAL '6 days'),
+(8,  'transactions', 'UPDATE', '{"status":"PENDING"}', '{"status":"FLAGGED","risk_score":92}',   NOW() - INTERVAL '6 days'),
+(4,  'cards',        'UPDATE', '{"status":"ACTIVE"}',  '{"status":"BLOCKED"}',                   NOW() - INTERVAL '3 days'),
+(7,  'cards',        'UPDATE', '{"status":"ACTIVE"}',  '{"status":"BLOCKED"}',                   NOW() - INTERVAL '10 days'),
+(1,  'fraud_alerts', 'INSERT', NULL,                   '{"alert_status":"OPEN","risk_score":95}', NOW() - INTERVAL '6 days');
+
+
+SELECT 'customers'              AS tbl, COUNT(*) FROM customers
+UNION ALL SELECT 'accounts',              COUNT(*) FROM accounts
+UNION ALL SELECT 'cards',                 COUNT(*) FROM cards
+UNION ALL SELECT 'fraud_rules',           COUNT(*) FROM fraud_rules
+UNION ALL SELECT 'transactions',          COUNT(*) FROM transactions
+UNION ALL SELECT 'transaction_status_history', COUNT(*) FROM transaction_status_history
+UNION ALL SELECT 'fraud_alerts',          COUNT(*) FROM fraud_alerts
+UNION ALL SELECT 'audit_log',             COUNT(*) FROM audit_log
+ORDER BY tbl;
