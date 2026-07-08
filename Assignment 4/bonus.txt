@@ -1,0 +1,16 @@
+127.0.0.1:6379> ZADD sales_leaderboard 150 "iPhone 17" 320 "iPhone 17 Pro" 90 "Macbook 15 Air" 210 "AirPods 3 Pro" 175 "AirPods 2 Pro"
+(integer) 5
+127.0.0.1:6379> ZREVRANGE sales_leaderboard 0 -1 WITHSCORES 
+ 1) "iPhone 17 Pro"
+ 2) "320"
+ 3) "AirPods 3 Pro"
+ 4) "210"
+ 5) "AirPods 2 Pro"
+ 6) "175"
+ 7) "iPhone 17"
+ 8) "150"
+ 9) "Macbook 15 Air"
+10) "90"
+127.0.0.1:6379> ZREVRANGE sales_leaderboard 0 0
+1) "iPhone 17 Pro"
+127.0.0.1:6379> 
